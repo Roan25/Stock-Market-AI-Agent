@@ -2,6 +2,7 @@ langchain
 langchain-core
 langchain-ollama
 langchain-community
+langchain-classic
 yfinance
 duckduckgo-search
 streamlit

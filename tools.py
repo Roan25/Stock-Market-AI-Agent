@@ -1,8 +1,5 @@
 import json
-import os
 import yfinance as yf
-import pandas as pd
-from typing import Union
 from duckduckgo_search import DDGS
 from langchain_core.tools import tool
 
@@ -23,12 +20,13 @@ def get_stock_price_and_fundamentals(ticker: str) -> str:
                 stock = fallback_stock
                 info = fallback_info
 
-        current_price = info.get("currentPrice") or info.get("regularMarketPrice", "N/A")
-        pe_ratio = info.get("trailingPE", "N/A")
-        market_cap = info.get("marketCap", "N/A")
-        week_high = info.get("fiftyTwoWeekHigh", "N/A")
-        week_low = info.get("fiftyTwoWeekLow", "N/A")
-        currency = info.get("currency", "")
+        # Safely handle None values returned for unprofitable or OTC tickers
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice") or "N/A"
+        pe_ratio = info.get("trailingPE") or "N/A"
+        market_cap = info.get("marketCap") or "N/A"
+        week_high = info.get("fiftyTwoWeekHigh") or "N/A"
+        week_low = info.get("fiftyTwoWeekLow") or "N/A"
+        currency = info.get("currency") or ""
 
         return (
             f"Ticker: {stock.ticker}\n"
@@ -39,11 +37,11 @@ def get_stock_price_and_fundamentals(ticker: str) -> str:
             f"52-Week Low: {week_low}"
         )
     except Exception as e:
-        return f"Error retrieving data for {ticker}: {str(e)}"
+        return f"Error retrieving fundamentals for {ticker}: {str(e)}"
 
 @tool
 def get_financial_statements(ticker: str) -> str:
-    """Returns a parsed summary of the latest income statement and balance sheet via yfinance.
+    """Returns a parsed summary of the latest annual Income Statement, Balance Sheet, and Cash Flow (Owner Earnings) via yfinance.
     Supports US tickers and Indian NSE tickers."""
     try:
         clean_ticker = ticker.strip().upper()
@@ -53,24 +51,51 @@ def get_financial_statements(ticker: str) -> str:
             if fallback_stock.financials is not None and not fallback_stock.financials.empty:
                 stock = fallback_stock
 
-        # Income Statement
-        income_stmt = stock.financials
+        # 1. Key Income Statement Line Items
         income_summary = {}
-        if income_stmt is not None and not income_stmt.empty:
-            recent_income = income_stmt.iloc[:, 0].dropna()
-            income_summary = {k: recent_income[k] for k in list(recent_income.keys())[:8]}
+        if stock.financials is not None and not stock.financials.empty:
+            income_col = stock.financials.iloc[:, 0].dropna()
+            target_income_keys = [
+                "Total Revenue", "Cost Of Revenue", "Gross Profit",
+                "Operating Income", "Net Income", "Diluted EPS", "Basic EPS"
+            ]
+            for key in target_income_keys:
+                if key in income_col:
+                    income_summary[key] = float(income_col[key])
 
-        # Balance Sheet
-        balance_sheet = stock.balance_sheet
+        # 2. Key Balance Sheet Line Items
         balance_summary = {}
-        if balance_sheet is not None and not balance_sheet.empty:
-            recent_balance = balance_sheet.iloc[:, 0].dropna()
-            balance_summary = {k: recent_balance[k] for k in list(recent_balance.keys())[:8]}
+        if stock.balance_sheet is not None and not stock.balance_sheet.empty:
+            bs_col = stock.balance_sheet.iloc[:, 0].dropna()
+            target_bs_keys = [
+                "Total Assets", "Cash And Cash Equivalents",
+                "Total Liabilities Net Minority Interest", "Total Debt",
+                "Net Debt", "Stockholders Equity"
+            ]
+            for key in target_bs_keys:
+                if key in bs_col:
+                    balance_summary[key] = float(bs_col[key])
+
+        # 3. Key Cash Flow Line Items (Buffett "Owner Earnings" & Free Cash Flow)
+        cashflow_summary = {}
+        if stock.cashflow is not None and not stock.cashflow.empty:
+            cf_col = stock.cashflow.iloc[:, 0].dropna()
+            target_cf_keys = [
+                "Operating Cash Flow", "Capital Expenditure", "Free Cash Flow"
+            ]
+            for key in target_cf_keys:
+                if key in cf_col:
+                    cashflow_summary[key] = float(cf_col[key])
+            
+            # Calculate Owner Earnings proxy if Free Cash Flow isn't explicitly listed
+            if "Free Cash Flow" not in cashflow_summary and "Operating Cash Flow" in cashflow_summary and "Capital Expenditure" in cashflow_summary:
+                cashflow_summary["Calculated Owner Earnings (FCF)"] = cashflow_summary["Operating Cash Flow"] - abs(cashflow_summary["Capital Expenditure"])
 
         result = {
             "ticker": stock.ticker,
-            "income_statement_recent": income_summary if income_summary else "No income statement data available",
-            "balance_sheet_recent": balance_summary if balance_summary else "No balance sheet data available"
+            "income_statement_latest": income_summary if income_summary else "No income statement data available",
+            "balance_sheet_latest": balance_summary if balance_summary else "No balance sheet data available",
+            "cash_flow_and_owner_earnings": cashflow_summary if cashflow_summary else "No cash flow data available"
         }
         return json.dumps(result, indent=2, default=str)
     except Exception as e:
@@ -100,27 +125,34 @@ def search_market_news(query: str) -> str:
     return "\n\n".join([f"Title: {r['title']}\nSnippet: {r.get('body', r.get('snippet', ''))}" for r in results])
 
 @tool
-def analyze_portfolio(portfolio_json: Union[str, dict]) -> str:
-    """Accepts a JSON string or dictionary of tickers and their percentage weights, e.g., '{"AAPL": 60, "MSFT": 40}' or {"AAPL": 60, "MSFT": 40}.
+def analyze_portfolio(portfolio_json: str) -> str:
+    """Accepts a JSON string of tickers and their percentage weights, e.g., '{\"AAPL\": 60, \"MSFT\": 40}'.
     Returns a text summary of sector diversification and basic risk."""
     try:
+        # Gracefully handle string or direct dictionary inputs from LLM tool callers
         if isinstance(portfolio_json, dict):
             data = portfolio_json
         elif isinstance(portfolio_json, str):
-            data = json.loads(portfolio_json)
+            # Clean possible escaped quotes or formatting artifacts
+            cleaned = portfolio_json.strip().replace("'", '"')
+            data = json.loads(cleaned)
         else:
-            return "Error: Input must be a dictionary or JSON string mapping tickers to percentage weights."
+            return "Error: Input must be a JSON string mapping tickers to percentage weights."
+
+        if not isinstance(data, dict):
+            return "Error: Portfolio must be a dictionary of ticker symbols to allocation percentages."
 
         total_weight = sum(float(w) for w in data.values())
         breakdown = [f"{ticker.upper()}: {weight}%" for ticker, weight in data.items()]
         
         status = "Balanced" if abs(total_weight - 100.0) < 0.5 else f"Warning: Total weight is {total_weight}% (should sum to 100%)"
         
-        # Sector lookups
+        # Sector analysis
         sectors = {}
         concentrated = []
         for ticker, weight in data.items():
-            if float(weight) > 30.0:
+            alloc = float(weight)
+            if alloc > 30.0:
                 concentrated.append(ticker.upper())
             try:
                 t = ticker.strip().upper()
@@ -128,12 +160,13 @@ def analyze_portfolio(portfolio_json: Union[str, dict]) -> str:
                 sec = s.info.get("sector")
                 if not sec and "." not in t:
                     s = yf.Ticker(f"{t}.NS")
-                    sec = s.info.get("sector", "Unknown")
-                sectors[sec] = sectors.get(sec, 0) + float(weight)
+                    sec = s.info.get("sector")
+                sector_name = sec if sec else "Unknown"
+                sectors[sector_name] = sectors.get(sector_name, 0) + alloc
             except Exception:
-                sectors["Unknown"] = sectors.get("Unknown", 0) + float(weight)
+                sectors["Unknown"] = sectors.get("Unknown", 0) + alloc
 
-        sector_summary = "\n".join([f"  - {sec}: {round(w, 2)}%" for sec, w in sectors.items()])
+        sector_summary = "\n".join([f"  - {sec}: {round(w, 2)}%" for sec, w in sorted(sectors.items(), key=lambda x: x[1], reverse=True)])
         risk_notes = []
         if concentrated:
             risk_notes.append(f"High concentration risk in {', '.join(concentrated)} (>30% allocation).")
@@ -152,57 +185,3 @@ def analyze_portfolio(portfolio_json: Union[str, dict]) -> str:
         return f"Invalid JSON format for portfolio. Details: {str(e)}"
     except Exception as e:
         return f"Error analyzing portfolio: {str(e)}"
-
-@tool
-def query_nifty50_historical_dataset(ticker: str) -> str:
-    """Queries the local Kaggle NIFTY-50 (2000-2021) dataset by Rohan Rao for long-term historical trading records.
-    Expects CSV files in './data/{TICKER}.csv' (e.g., RELIANCE.csv, TCS.csv)."""
-    try:
-        symbol = ticker.strip().upper().replace(".NS", "").replace(".BO", "")
-        # Check potential local paths
-        possible_paths = [
-            f"./data/{symbol}.csv",
-            f"./data/NIFTY50/{symbol}.csv",
-            f"C:/Users/rohan/.gemini/antigravity/scratch/buffett_agent/data/{symbol}.csv"
-        ]
-        
-        target_path = None
-        for p in possible_paths:
-            if os.path.exists(p):
-                target_path = p
-                break
-
-        if not target_path:
-            return (
-                f"Kaggle NIFTY-50 archive file for '{symbol}.csv' not found locally in './data/'. "
-                f"To query long-term 2000-2021 historical data, download the dataset from "
-                f"https://www.kaggle.com/datasets/rohanrao/nifty50-stock-market-data and place the CSV files in './data/'."
-            )
-
-        df = pd.read_csv(target_path)
-        if df.empty:
-            return f"Dataset for {symbol} is empty."
-
-        # Compute summary metrics from Kaggle dataset
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.sort_values("Date")
-        start_date = df["Date"].min().strftime("%Y-%m-%d")
-        end_date = df["Date"].max().strftime("%Y-%m-%d")
-        total_days = len(df)
-        all_time_high = df["High"].max()
-        all_time_low = df["Low"].min()
-        avg_vwap = df["VWAP"].mean()
-        latest_row = df.iloc[-1]
-
-        return (
-            f"Kaggle NIFTY-50 Historical Archive for {symbol} ({start_date} to {end_date}):\n"
-            f"Total Trading Records: {total_days} sessions\n"
-            f"Historical Low: {all_time_low}\n"
-            f"Historical High: {all_time_high}\n"
-            f"Historical Average VWAP: {round(avg_vwap, 2)}\n"
-            f"Archive Final Date: {end_date}\n"
-            f"Archive Final Close: {latest_row['Close']}\n"
-            f"Archive Deliverable Volume %: {latest_row.get('%Deliverble', 'N/A')}\n"
-        )
-    except Exception as e:
-        return f"Error reading Kaggle NIFTY-50 historical dataset for {ticker}: {str(e)}"

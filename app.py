@@ -2,6 +2,21 @@ import streamlit as st
 from agent import build_stock_agent
 from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
 
+def sync_agent_memory(agent_executor, messages):
+    """
+    Synchronizes the agent's internal window memory with the Streamlit chat history,
+    ensuring switching models or restoring sessions keeps memory in 100% lockstep.
+    """
+    if hasattr(agent_executor, "memory") and agent_executor.memory is not None:
+        agent_executor.memory.clear()
+        user_input = None
+        for msg in messages:
+            if msg["role"] == "user":
+                user_input = msg["content"]
+            elif msg["role"] == "assistant" and user_input is not None:
+                agent_executor.memory.save_context({"input": user_input}, {"output": msg["content"]})
+                user_input = None
+
 # 1. Page Configuration
 st.set_page_config(
     page_title="Value Investing Market Agent",
@@ -34,22 +49,30 @@ with st.sidebar:
     st.markdown("- *'Analyze AAPL fundamentals and recent news from a value investor perspective.'*")
     st.markdown("- *'Give me a breakdown of RELIANCE or TCS based on current financial metrics.'*")
     st.markdown("- *'Analyze my portfolio risk: {\"AAPL\": 40, \"MSFT\": 35, \"TSLA\": 25}'*")
-    st.markdown("- *'Check historical archive data for RELIANCE from the Kaggle dataset.'*")
+    st.markdown("- *'What are the owner earnings and free cash flow for Microsoft?'*")
 
     st.markdown("---")
     if st.button("🗑️ Clear Chat History", use_container_width=True):
         st.session_state.messages = []
-        st.session_state.agent_executor = build_stock_agent(model_choice)
+        if "agent_executor" in st.session_state and hasattr(st.session_state.agent_executor, "memory"):
+            st.session_state.agent_executor.memory.clear()
         st.rerun()
 
-# 3. Session State Initialization
+# 3. Session State Initialization & Memory Synchronization
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "current_model" not in st.session_state or st.session_state.current_model != model_choice:
+# If model was switched or agent not initialized, re-create agent and sync existing memory
+if ("agent_executor" not in st.session_state or
+    "current_model" not in st.session_state or
+    st.session_state.current_model != model_choice):
+    
     st.session_state.current_model = model_choice
     try:
-        st.session_state.agent_executor = build_stock_agent(model_choice)
+        new_agent = build_stock_agent(model_choice)
+        # Re-hydrate the new agent's memory with previous dialog history
+        sync_agent_memory(new_agent, st.session_state.messages)
+        st.session_state.agent_executor = new_agent
     except Exception as e:
         st.error(f"Failed to initialize Ollama agent with '{model_choice}'. Is Ollama running? Error: {e}")
         st.stop()
@@ -59,29 +82,29 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# 5. Handle User Input & Streaming Tool Thoughts
+# 5. Handle User Input & Live Tool Execution
 if prompt := st.chat_input("Ask about a stock, market trend, or portfolio allocation..."):
     # Display user query
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Generate assistant response with visual tool execution status
+    # Generate assistant response with real-time tool thoughts
     with st.chat_message("assistant"):
+        thought_container = st.container()
         st_callback = StreamlitCallbackHandler(
-            st.container(),
+            thought_container,
             expand_new_thoughts=True,
             collapse_completed_thoughts=True
         )
         try:
-            with st.spinner("Analyzing fundamentals and consulting tools..."):
-                response = st.session_state.agent_executor.invoke(
-                    {"input": prompt},
-                    {"callbacks": [st_callback]}
-                )
-                output_text = response["output"]
-                st.markdown(output_text)
-                st.session_state.messages.append({"role": "assistant", "content": output_text})
+            response = st.session_state.agent_executor.invoke(
+                {"input": prompt},
+                {"callbacks": [st_callback]}
+            )
+            output_text = response["output"]
+            st.markdown(output_text)
+            st.session_state.messages.append({"role": "assistant", "content": output_text})
 
         except Exception as e:
             error_message = f"Agent Execution Error: {str(e)}"
