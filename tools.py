@@ -2,26 +2,26 @@ import json
 import os
 import yfinance as yf
 import pandas as pd
+from typing import Union
 from duckduckgo_search import DDGS
 from langchain_core.tools import tool
 
 @tool
 def get_stock_price_and_fundamentals(ticker: str) -> str:
     """Fetches current price, P/E ratio, market cap, and 52-week high/low range for a given stock ticker.
-    For Indian NSE stocks, automatically appends .NS if omitted (e.g., 'RELIANCE', 'TCS')."""
+    Supports US tickers (e.g., 'AAPL', 'MSFT') and Indian NSE tickers (e.g., 'RELIANCE', 'TCS')."""
     try:
         clean_ticker = ticker.strip().upper()
-        # If it looks like an Indian stock ticker without exchange suffix, attempt .NS first
-        if not clean_ticker.endswith(".NS") and not clean_ticker.endswith(".BO") and len(clean_ticker) <= 15:
-            # Try fetching with .NS first, fallback to original if not found
-            stock = yf.Ticker(f"{clean_ticker}.NS")
-            info = stock.info
-            if not info or info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
-                stock = yf.Ticker(clean_ticker)
-                info = stock.info
-        else:
-            stock = yf.Ticker(clean_ticker)
-            info = stock.info
+        stock = yf.Ticker(clean_ticker)
+        info = stock.info
+
+        # Fallback to .NS for Indian tickers if base ticker returned no pricing data
+        if (not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None)) and "." not in clean_ticker:
+            fallback_stock = yf.Ticker(f"{clean_ticker}.NS")
+            fallback_info = fallback_stock.info
+            if fallback_info and (fallback_info.get("regularMarketPrice") is not None or fallback_info.get("currentPrice") is not None):
+                stock = fallback_stock
+                info = fallback_info
 
         current_price = info.get("currentPrice") or info.get("regularMarketPrice", "N/A")
         pe_ratio = info.get("trailingPE", "N/A")
@@ -44,15 +44,14 @@ def get_stock_price_and_fundamentals(ticker: str) -> str:
 @tool
 def get_financial_statements(ticker: str) -> str:
     """Returns a parsed summary of the latest income statement and balance sheet via yfinance.
-    For Indian stocks, appends .NS if needed."""
+    Supports US tickers and Indian NSE tickers."""
     try:
         clean_ticker = ticker.strip().upper()
-        if not clean_ticker.endswith(".NS") and not clean_ticker.endswith(".BO"):
-            stock = yf.Ticker(f"{clean_ticker}.NS")
-            if stock.financials is None or stock.financials.empty:
-                stock = yf.Ticker(clean_ticker)
-        else:
-            stock = yf.Ticker(clean_ticker)
+        stock = yf.Ticker(clean_ticker)
+        if (stock.financials is None or stock.financials.empty) and "." not in clean_ticker:
+            fallback_stock = yf.Ticker(f"{clean_ticker}.NS")
+            if fallback_stock.financials is not None and not fallback_stock.financials.empty:
+                stock = fallback_stock
 
         # Income Statement
         income_stmt = stock.financials
@@ -79,24 +78,38 @@ def get_financial_statements(ticker: str) -> str:
 
 @tool
 def search_market_news(query: str) -> str:
-    """Uses DuckDuckGo to search for recent macroeconomic news or earnings reports."""
+    """Uses DuckDuckGo to search for recent macroeconomic news, company updates, or earnings reports."""
+    results = []
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=4))
-        if not results:
-            return "No recent news found for this query."
-        return "\n\n".join([f"Title: {r['title']}\nSnippet: {r['body']}" for r in results])
-    except Exception as e:
-        return f"Error searching web: {str(e)}"
+            news_results = list(ddgs.news(query, max_results=4))
+            if news_results:
+                results = news_results
+    except Exception:
+        pass
+
+    if not results:
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=4))
+        except Exception as e:
+            return f"Market search rate-limited or temporarily unavailable: {str(e)}"
+
+    if not results:
+        return "No recent news found for this query."
+    return "\n\n".join([f"Title: {r['title']}\nSnippet: {r.get('body', r.get('snippet', ''))}" for r in results])
 
 @tool
-def analyze_portfolio(portfolio_json: str) -> str:
-    """Accepts a JSON string of tickers and their percentage weights, e.g., '{\"AAPL\": 60, \"MSFT\": 40}'.
+def analyze_portfolio(portfolio_json: Union[str, dict]) -> str:
+    """Accepts a JSON string or dictionary of tickers and their percentage weights, e.g., '{"AAPL": 60, "MSFT": 40}' or {"AAPL": 60, "MSFT": 40}.
     Returns a text summary of sector diversification and basic risk."""
     try:
-        data = json.loads(portfolio_json)
-        if not isinstance(data, dict):
-            return "Error: Input must be a JSON dictionary mapping tickers to percentage weights."
+        if isinstance(portfolio_json, dict):
+            data = portfolio_json
+        elif isinstance(portfolio_json, str):
+            data = json.loads(portfolio_json)
+        else:
+            return "Error: Input must be a dictionary or JSON string mapping tickers to percentage weights."
 
         total_weight = sum(float(w) for w in data.values())
         breakdown = [f"{ticker.upper()}: {weight}%" for ticker, weight in data.items()]
@@ -111,14 +124,10 @@ def analyze_portfolio(portfolio_json: str) -> str:
                 concentrated.append(ticker.upper())
             try:
                 t = ticker.strip().upper()
-                if not t.endswith(".NS") and not t.endswith(".BO"):
+                s = yf.Ticker(t)
+                sec = s.info.get("sector")
+                if not sec and "." not in t:
                     s = yf.Ticker(f"{t}.NS")
-                    sec = s.info.get("sector")
-                    if not sec:
-                        s = yf.Ticker(t)
-                        sec = s.info.get("sector", "Unknown")
-                else:
-                    s = yf.Ticker(t)
                     sec = s.info.get("sector", "Unknown")
                 sectors[sec] = sectors.get(sec, 0) + float(weight)
             except Exception:

@@ -1,6 +1,14 @@
-from langchain.agents import AgentExecutor, create_tool_calling_agent
+try:
+    from langchain.agents import AgentExecutor, create_tool_calling_agent
+except ImportError:
+    from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
+
+try:
+    from langchain.memory import ConversationBufferMemory
+except ImportError:
+    from langchain_classic.memory import ConversationBufferMemory
+
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.memory import ConversationBufferMemory
 from langchain_ollama import ChatOllama
 from tools import (
     analyze_portfolio,
